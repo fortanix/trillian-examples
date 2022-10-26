@@ -30,12 +30,13 @@ import (
 	"strings"
 
 	"github.com/golang/glog"
-	"github.com/google/trillian-examples/formats/log"
 	"github.com/google/trillian-examples/serverless/client"
 	"github.com/google/trillian-examples/serverless/client/witness"
 	"github.com/transparency-dev/merkle/proof"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"golang.org/x/mod/sumdb/note"
+
+	s_note "github.com/google/trillian-examples/serverless/internal/note"
 )
 
 func defaultCacheLocation() string {
@@ -92,13 +93,13 @@ func main() {
 	flag.Parse()
 	ctx := context.Background()
 
-	logSigV, pubK, err := logSigVerifier(*logPubKeyFile)
+	logSigV, pubKID, err := s_note.NewVerifierWithKeyID(*logPubKeyFile, "--log_public_key")
 	if err != nil {
 		glog.Exitf("failed to read log public key: %v", err)
 	}
 	logID := *logID
 	if logID == "" {
-		logID = log.ID(*origin, pubK)
+		logID = pubKID
 	}
 
 	u := *logURL
@@ -400,32 +401,6 @@ func storeLocalCheckpoint(logID string, cpRaw []byte) error {
 		return err
 	}
 	return os.Rename(cpPathTmp, cpPath)
-}
-
-// Returns a log signature verifier and the public key bytes it uses.
-// Attempts to read key material from f, or uses the SERVERLESS_LOG_PUBLIC_KEY
-// env var if f is unset.
-func logSigVerifier(f string) (note.Verifier, []byte, error) {
-	var pubKey []byte
-	var err error
-	if len(f) > 0 {
-		pubKey, err = ioutil.ReadFile(f)
-		if err != nil {
-			return nil, nil, fmt.Errorf("failed to read public key from file %q: %v", f, err)
-		}
-	} else {
-		pubKey = []byte(os.Getenv("SERVERLESS_LOG_PUBLIC_KEY"))
-		if len(pubKey) == 0 {
-			return nil, nil, fmt.Errorf("supply public key file path using --log_public_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
-		}
-	}
-
-	v, err := note.NewVerifier(string(pubKey))
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create verifier: %v", err)
-	}
-
-	return v, pubKey, nil
 }
 
 func witnessSigVerifiers(fs []string) ([]note.Verifier, error) {

@@ -22,17 +22,16 @@ import (
 	"flag"
 	"fmt"
 	"io/ioutil"
-	"os"
 	"path/filepath"
 
 	"github.com/google/trillian-examples/serverless/internal/storage/fs"
-	"golang.org/x/mod/sumdb/note"
 
 	"github.com/golang/glog"
 	"github.com/google/trillian-examples/serverless/pkg/log"
 	"github.com/transparency-dev/merkle/rfc6962"
 
 	fmtlog "github.com/google/trillian-examples/formats/log"
+	s_note "github.com/google/trillian-examples/serverless/internal/note"
 )
 
 var (
@@ -45,21 +44,10 @@ var (
 func main() {
 	flag.Parse()
 
-	// Read log public key from file or environment variable
-	var pubKey string
-	if len(*pubKeyFile) > 0 {
-		k, err := ioutil.ReadFile(*pubKeyFile)
-		if err != nil {
-			glog.Exitf("failed to read public_key file: %q", err)
-		}
-		pubKey = string(k)
-	} else {
-		pubKey = os.Getenv("SERVERLESS_LOG_PUBLIC_KEY")
-		if len(pubKey) == 0 {
-			glog.Exit("supply public key file path using --public_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
-		}
+	v, err := s_note.NewVerifier(*pubKeyFile, "--public_key")
+	if err != nil {
+		glog.Exitf("failed to read log public key: %v", err)
 	}
-
 	toAdd, err := filepath.Glob(*entries)
 	if err != nil {
 		glog.Exitf("Failed to glob entries %q: %q", *entries, err)
@@ -77,7 +65,6 @@ func main() {
 	}
 
 	// Check signatures
-	v, err := note.NewVerifier(pubKey)
 	if err != nil {
 		glog.Exitf("Failed to instantiate Verifier: %q", err)
 	}
