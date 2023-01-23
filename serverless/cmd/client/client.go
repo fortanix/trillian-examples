@@ -358,6 +358,7 @@ func (l *logClientTool) inclusionProof(ctx context.Context, args []string) error
 
                 if err := os.WriteFile(oj, ps, 0644); err != nil {
 			glog.Warningf("Failed to write JSON inclusion proof to %q: %v", oj, err)
+			return err
                 }
         }
 
