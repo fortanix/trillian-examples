@@ -23,13 +23,13 @@ import (
 	"net/http"
 
 	"github.com/golang/glog"
-	logfmt "github.com/google/trillian-examples/formats/log"
 	i_note "github.com/google/trillian-examples/internal/note"
 	ih "github.com/google/trillian-examples/witness/golang/internal/http"
 	wsql "github.com/google/trillian-examples/witness/golang/internal/persistence/sql"
 	"github.com/google/trillian-examples/witness/golang/internal/witness"
 	"github.com/gorilla/mux"
 	_ "github.com/mattn/go-sqlite3" // Load drivers for sqlite3
+	logfmt "github.com/transparency-dev/formats/log"
 	"github.com/transparency-dev/merkle/rfc6962"
 	"golang.org/x/mod/sumdb/note"
 )
@@ -85,6 +85,9 @@ func (config LogConfig) AsLogMap() (map[string]witness.LogInfo, error) {
 		logID := log.LogID
 		if len(logID) == 0 {
 			logID = logfmt.ID(log.Origin, []byte(log.PublicKey))
+		}
+		if oldLog, found := logMap[logID]; found {
+			return nil, fmt.Errorf("colliding log configs found for key %x: %+v and %+v", logID, oldLog, logInfo)
 		}
 		logMap[logID] = logInfo
 	}
