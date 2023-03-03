@@ -44,6 +44,7 @@ require (
 	cloud.google.com/go/profiler v0.3.0 // indirect
 	github.com/dsoprea/go-logging v0.0.0-20200710184922-b02d349568dd // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
+	github.com/fortanix/sdkms-client-go v0.2.2 // indirect
 	github.com/go-errors/errors v1.0.2 // indirect
 	github.com/go-interpreter/wagon v0.6.0 // indirect
 	github.com/go-logr/logr v1.2.0 // indirect
@@ -55,6 +56,7 @@ require (
 	github.com/google/uuid v1.3.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.2.0 // indirect
 	github.com/googleapis/gax-go/v2 v2.7.0 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/vmihailenco/msgpack v4.0.4+incompatible // indirect
 	go.opencensus.io v0.24.0 // indirect
 	golang.org/x/net v0.5.0 // indirect

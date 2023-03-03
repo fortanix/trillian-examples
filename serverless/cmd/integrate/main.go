@@ -18,10 +18,17 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
+	"encoding/binary"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 
+	"github.com/fortanix/sdkms-client-go/sdkms"
 	"github.com/golang/glog"
 	"github.com/google/trillian-examples/serverless/internal/storage/fs"
 	"github.com/google/trillian-examples/serverless/pkg/log"
@@ -37,7 +44,59 @@ var (
 	pubKeyFile  = flag.String("public_key", "", "Location of public key file. If unset, uses the contents of the SERVERLESS_LOG_PUBLIC_KEY environment variable.")
 	privKeyFile = flag.String("private_key", "", "Location of private key file. If unset, uses the contents of the SERVERLESS_LOG_PRIVATE_KEY environment variable.")
 	origin      = flag.String("origin", "", "Log origin string to use in produced checkpoint.")
+	dsmKeyId    = flag.String("dsm_key_id", "", "ID of key in DSM to use for signing")
+	dsmApiKey   = flag.String("dsm_api_key", "", "API key for accessing smartkey")
+	dsmEndpoint = flag.String("dsm_endpoint", "https://www.smartkey.io", "DSM instance to use when signing with DSM")
+	pubKeyOut   = flag.String("public_key_out", "", "When initializing and using a DSM signing key, write the public key to this file")
 )
+
+const Ed25519PubKeyLength = 32
+
+// The keyHash implementation is copied from the Note keyHash implementation. This function is private to Note
+// for no good reason. We want to use the same key hashing function because the key hashes are used internally
+// by the Note package for identifying which keys were used to sign a Note.
+
+// keyHash computes the key hash for the given server name and encoded public key.
+func keyHash(name string, key []byte) uint32 {
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte("\n"))
+	h.Write(key)
+	sum := h.Sum(nil)
+	return binary.BigEndian.Uint32(sum)
+}
+
+// This type and associated functions implement the note.Signer signing interface, but sign using a key in DSM.
+type dsmSigner struct {
+	name string
+	hash uint32
+	client *sdkms.Client
+	key *sdkms.SobjectDescriptor
+}
+
+func (signer *dsmSigner) Name() string {
+	return signer.name
+}
+
+func (signer *dsmSigner) KeyHash() uint32 {
+	return signer.hash
+}
+
+func (signer *dsmSigner) Sign(msg []byte) ([]byte, error) {
+	request := sdkms.SignRequest{
+		Key: signer.key,
+		HashAlg: sdkms.DigestAlgorithmSha512,
+		Data: &msg,
+	}
+	// TODO: Only implementing signing without approvals right now. Signing with approvals still needs to be
+	// implemented.
+	response, error := signer.client.Sign(context.Background(), request)
+	if error != nil {
+		return nil, error
+	}
+
+	return response.Signature, nil
+}
 
 func main() {
 	flag.Parse()
@@ -48,39 +107,16 @@ func main() {
 	}
 
 	h := rfc6962.DefaultHasher
-	// Read log public key from file or environment variable
-	var pubKey string
-	var err error
-	if len(*pubKeyFile) > 0 {
-		pubKey, err = getKeyFile(*pubKeyFile)
-		if err != nil {
-			glog.Exitf("Unable to get public key: %q", err)
-		}
-	} else {
-		pubKey = os.Getenv("SERVERLESS_LOG_PUBLIC_KEY")
-		if len(pubKey) == 0 {
-			glog.Exit("Supply public key file path using --public_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
-		}
-	}
-	// Read log private key from file or environment variable
-	var privKey string
-	if len(*privKeyFile) > 0 {
-		privKey, err = getKeyFile(*privKeyFile)
-		if err != nil {
-			glog.Exitf("Unable to get private key: %q", err)
-		}
-	} else {
-		privKey = os.Getenv("SERVERLESS_LOG_PRIVATE_KEY")
-		if len(privKey) == 0 {
-			glog.Exit("Supply private key file path using --private_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
-		}
-	}
 
-	var cpNote note.Note
-	s, err := note.NewSigner(privKey)
+	var verifier note.Verifier
+	var signer note.Signer
+	var err error
+
+	verifier, signer, err = getKeys()
 	if err != nil {
-		glog.Exitf("Failed to instantiate signer: %q", err)
+		glog.Exitf("%s", err)
 	}
+	var cpNote note.Note
 
 	if *initialise {
 		st, err := fs.Create(*storageDir)
@@ -90,7 +126,7 @@ func main() {
 		cp := fmtlog.Checkpoint{
 			Hash: h.EmptyRoot(),
 		}
-		if err := signAndWrite(ctx, &cp, cpNote, s, st); err != nil {
+		if err := signAndWrite(ctx, &cp, cpNote, signer, st); err != nil {
 			glog.Exitf("Failed to sign: %q", err)
 		}
 		os.Exit(0)
@@ -103,11 +139,7 @@ func main() {
 	}
 
 	// Check signatures
-	v, err := note.NewVerifier(pubKey)
-	if err != nil {
-		glog.Exitf("Failed to instantiate Verifier: %q", err)
-	}
-	cp, _, _, err := fmtlog.ParseCheckpoint(cpRaw, *origin, v)
+	cp, _, _, err := fmtlog.ParseCheckpoint(cpRaw, *origin, verifier)
 	if err != nil {
 		glog.Exitf("Failed to open Checkpoint: %q", err)
 	}
@@ -125,10 +157,177 @@ func main() {
 		glog.Exit("Nothing to integrate")
 	}
 
-	err = signAndWrite(ctx, newCp, cpNote, s, st)
+	err = signAndWrite(ctx, newCp, cpNote, signer, st)
 	if err != nil {
 		glog.Exitf("Failed to sign: %q", err)
 	}
+}
+
+// Extracts the key's name (for golang Note purposes) from the key metadata. It is an error if the name field
+// does not exist within the metadata. Note that this is separate from the key's actual name in DSM, which
+// must be unique (within the account).
+func getDsmKeyName(key *sdkms.Sobject) (string, error) {
+	if key.CustomMetadata == nil {
+		return "", fmt.Errorf("key had no custom metadata")
+	}
+
+	return (*key.CustomMetadata)["name"], nil
+}
+
+// Returns a Note.Verifier for a DSM signing key's public key. Since this is the public key, we can get the actual
+// key material and verify signatures locally without using DSM.
+func makeDsmVerifier(name string, key *sdkms.Sobject) (note.Verifier, uint32, error) {
+	pubAny, err := x509.ParsePKIXPublicKey(*key.PubKey)
+
+	pub := pubAny.(ed25519.PublicKey)
+	if len(pub) != Ed25519PubKeyLength {
+		return nil, 0,fmt.Errorf("Invalid key length for ed25519 public key. Expected %d, got %d",
+			Ed25519PubKeyLength, len(pub))
+	}
+
+	// In Note format, the first byte of the key is the key algorithm. 1 indicates ed25519, which is the only
+	// supported key type right now.
+	pub = append([]byte{1}, pub...)
+	
+	pubKeyHash := keyHash(name, pub)
+	
+	// Unfortunately, the only provided interface to construct a standard Note verifier is via this formatted
+	// string. The alternative here is creating our own Verifier-compatible type we could directly populate,
+	// but that would involve essentially copying code from the Note implementation. It's simpler (if uglier)
+	// to string-format the public key in the way expected by Note.
+	keyString := fmt.Sprintf("%s+%08x+%s", name, pubKeyHash, base64.StdEncoding.EncodeToString(pub))
+
+	// Write the public key to a file if requested.
+	if len(*pubKeyOut) > 0 {
+		err := writeFileIfNotExists(*pubKeyOut, keyString)
+		if err != nil {
+			return nil, 0, fmt.Errorf("Unable to write public key to %s: %q", *pubKeyOut, err)
+		}
+	}
+
+	verifier, err := note.NewVerifier(keyString)
+	if err != nil {
+		return nil, 0, fmt.Errorf("Unable to construct note.Verifier: %q", err)
+	}
+
+	return verifier, pubKeyHash, nil
+}
+
+// Create a Note.Signer-compatible signer that will sign using a DSM key. Unlike with the Verifier, we have to
+// construct our own Signer type that performs the signing in DSM.
+func makeDsmSigner(client *sdkms.Client, name string, keyHash uint32, key *sdkms.SobjectDescriptor) *dsmSigner {
+	return &dsmSigner{
+		name: name,
+		hash: keyHash,
+		client: client,
+		key: key,
+	}
+}
+
+func getDsmKeys() (note.Verifier, note.Signer, error) {
+	if len(*dsmApiKey) == 0 {
+		return nil, nil, fmt.Errorf("When signing with DSM, --dsm_key_id and --dsm_api_key must both be provided")
+	}
+
+	if len(*dsmKeyId) == 0 {
+		return nil, nil, fmt.Errorf("When signing with DSM, --dsm_key_id and --dsm_api_key must both be provided")
+	}
+
+	client := sdkms.Client{
+		HTTPClient: http.DefaultClient,
+		Auth: sdkms.APIKey(*dsmApiKey),
+		Endpoint: *dsmEndpoint,
+	}
+	keyid := sdkms.SobjectDescriptor{
+		Kid: dsmKeyId,
+	}
+
+	key, err := client.GetSobject(context.Background(), nil, keyid)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Unable to get key details from DSM: %q", err)
+	}
+
+	// Check to see if the specified key is suitable.
+	if key.ObjType != sdkms.ObjectTypeEc {
+		return nil, nil, fmt.Errorf("DSM key was not an elliptic curve key")
+	}
+
+	if key.EllipticCurve == nil {
+		return nil, nil, fmt.Errorf("DSM key did not have an elliptic curve type")
+	}
+
+	if *key.EllipticCurve != sdkms.EllipticCurveEd25519 {
+		return nil, nil, fmt.Errorf("DSM key had incorrect elliptic curve type")
+	}
+
+	if key.KeyOps & sdkms.KeyOperationsSign == 0 {
+		return nil, nil, fmt.Errorf("DSM key did not have Sign operation enabled")
+	}
+
+	name, err := getDsmKeyName(key)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	verifier, pubKeyHash, err := makeDsmVerifier(name, key)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Unable to construct verifier: %q", err)
+	}
+
+	signer := makeDsmSigner(&client, name, pubKeyHash, &keyid)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Unable to construct signer: %q", err)
+	}
+	
+	return verifier, signer, nil
+}
+
+// Returns Note-compatible Verifier and Signer, based on the requested key type (local or DSM).
+func getKeys() (note.Verifier, note.Signer, error) {
+	// DSM key requested.
+	if len(*dsmKeyId) > 0 || len(*dsmApiKey) > 0 {
+		return getDsmKeys()
+	}
+
+	// Non-DSM keys. Read log public key from file or environment variable
+	var pubKey string
+	var err error
+	if len(*pubKeyFile) > 0 {
+		pubKey, err = getKeyFile(*pubKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Unable to get public key: %q", err)
+		}
+	} else {
+		pubKey = os.Getenv("SERVERLESS_LOG_PUBLIC_KEY")
+		if len(pubKey) == 0 {
+			return nil, nil, fmt.Errorf("Supply public key file path using --public_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
+		}
+	}
+	verifier, err := note.NewVerifier(pubKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Failed to instantiate Verifier: %q", err)
+	}
+	
+	// Read log private key from file or environment variable
+	var privKey string
+	if len(*privKeyFile) > 0 {
+		privKey, err = getKeyFile(*privKeyFile)
+		if err != nil {
+			return nil, nil, fmt.Errorf("Unable to get private key: %q", err)
+		}
+	} else {
+		privKey = os.Getenv("SERVERLESS_LOG_PRIVATE_KEY")
+		if len(privKey) == 0 {
+			return nil, nil, fmt.Errorf("Supply private key file path using --private_key or set SERVERLESS_LOG_PUBLIC_KEY environment variable")
+		}
+	}
+
+	s, err := note.NewSigner(privKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("Failed to instantiate signer: %q", err)
+	}
+
+	return verifier, s, nil
 }
 
 func getKeyFile(path string) (string, error) {
@@ -150,4 +349,17 @@ func signAndWrite(ctx context.Context, cp *fmtlog.Checkpoint, cpNote note.Note, 
 		return fmt.Errorf("failed to store new log checkpoint: %w", err)
 	}
 	return nil
+}
+
+// writeFileIfNotExists writes key files. Ensures files do not already exist to avoid accidental overwriting.
+func writeFileIfNotExists(filename string, key string) error {
+	file, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return fmt.Errorf("unable to create new key file %q: %w", filename, err)
+	}
+	_, err = file.WriteString(key)
+	if err != nil {
+		return fmt.Errorf("unable to write new key file %q: %w", filename, err)
+	}
+	return file.Close()
 }
