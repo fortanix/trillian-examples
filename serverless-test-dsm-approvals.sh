@@ -12,6 +12,12 @@ if [ -z "$API_KEY" ] ; then
     exit 1
 fi
 
+if [ -z "$APPROVER_API_KEY" ] ; then
+    echo "Set the environment variable APPROVER_API_KEY to the API key to use for approving requests"
+    exit 1
+fi
+
+
 if [ -z "$KEY_ID" ]; then
     echo "Set the environment variable KEY_ID to the key to use for testing"
     exit 1
@@ -47,6 +53,7 @@ set -x
 #
 # serverless command paths
 #
+approve="$SERVERLESS_DIR/approve/approve"
 client="$SERVERLESS_DIR/client/client"
 generate_keys="$SERVERLESS_DIR/generate_keys/generate_keys"
 integrate="$SERVERLESS_DIR/integrate/integrate"
@@ -71,7 +78,9 @@ trap cleanup EXIT
 # For the DSM test, we don't need to generate keys, as they're stored in DSM.
 #"$generate_keys" "$keyname" --out_pub=public --out_priv=private
 
-"$integrate" --initialise --logtostderr "$storage_dir" --public_key_out=public --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY "$origin"
+"$integrate" --initialise --logtostderr "$storage_dir" --public_key_out=public --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY "$origin" --suspend "$tmpdir/suspend"
+"$approve" --dsm_api_key "$APPROVER_API_KEY" --state "$tmpdir/suspend"
+"$integrate" --initialise --logtostderr "$storage_dir" --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY "$origin" --resume "$tmpdir/suspend"
 
 public_material=$(cat public)
 
@@ -85,12 +94,16 @@ done
 # environment variable)
 for i in {1..32} ; do
     "$sequence" "$storage_dir" --public_key=public --entries "entries/$i" --logtostderr "$origin"
-    "$integrate" "$storage_dir" --public_key=public --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin"
+    "$integrate" "$storage_dir" --public_key=public --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin" --suspend "$tmpdir/suspend"
+    "$approve" --dsm_api_key $APPROVER_API_KEY --state "$tmpdir/suspend"
+    "$integrate" "$storage_dir" --public_key=public --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin" --resume "$tmpdir/suspend"
 done
 
 for i in {33..64} ; do
     SERVERLESS_LOG_PUBLIC_KEY="$public_material" "$sequence" "$storage_dir" --entries "entries/$i" --logtostderr "$origin"
-    "$integrate" "$storage_dir" --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin"
+    "$integrate" "$storage_dir" --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin" --suspend "$tmpdir/suspend"
+    "$approve" --dsm_api_key $APPROVER_API_KEY --state "$tmpdir/suspend"
+    "$integrate" "$storage_dir" --dsm_key_id=$KEY_ID --dsm_api_key=$API_KEY --logtostderr "$origin" --resume "$tmpdir/suspend"
 done
 
 # Client inclusion test.

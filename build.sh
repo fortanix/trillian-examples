@@ -1,4 +1,4 @@
-#!/bin/bash -exu
+#!/bin/bash -ex
 
 set -o pipefail
 
@@ -20,7 +20,7 @@ source "$TOOLCHAIN_DIR/shell/malbork_env"
 
 cd "$repo_root/serverless/cmd"
 
-for i in client generate_keys integrate sequence ; do
+for i in approve client generate_keys integrate sequence ; do
     pushd $i
     rm -f $i
     go build .

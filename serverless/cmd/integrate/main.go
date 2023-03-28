@@ -17,16 +17,19 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/fortanix/sdkms-client-go/sdkms"
 	"github.com/golang/glog"
@@ -48,9 +51,17 @@ var (
 	dsmApiKey   = flag.String("dsm_api_key", "", "API key for accessing smartkey")
 	dsmEndpoint = flag.String("dsm_endpoint", "https://www.smartkey.io", "DSM instance to use when signing with DSM")
 	pubKeyOut   = flag.String("public_key_out", "", "When initializing and using a DSM signing key, write the public key to this file")
+	suspend     = flag.String("suspend", "", "Write state to a file and suspend signing if approval is required")
+	resume      = flag.String("resume", "", "Resume signing after a previous signing attempt was suspended")
 )
 
 const Ed25519PubKeyLength = 32
+
+// The saved state necessary to resume a signing request.
+type QuorumSigningState struct {
+	Msg []byte
+	RequestID sdkms.UUID
+}
 
 // The keyHash implementation is copied from the Note keyHash implementation. This function is private to Note
 // for no good reason. We want to use the same key hashing function because the key hashes are used internally
@@ -82,20 +93,110 @@ func (signer *dsmSigner) KeyHash() uint32 {
 	return signer.hash
 }
 
+func (signer *dsmSigner) waitForApproval(status sdkms.ApprovalStatus, requestID sdkms.UUID) ([]byte, error) {
+	ctx := context.Background()
+	for status == sdkms.ApprovalStatusPending {
+		glog.Info("Waiting for signing request to be approved...")
+		time.Sleep(10 * time.Second)
+		approvalRequest, err := signer.client.GetApprovalRequest(ctx, requestID)
+		if err != nil {
+			return nil, fmt.Errorf("GetApprovalRequest failed: %q", err)
+		}
+		status = approvalRequest.Status
+	}
+	switch status {
+	case sdkms.ApprovalStatusApproved, sdkms.ApprovalStatusFailed:
+		res, err := signer.client.GetApprovalRequestResult(ctx, requestID)
+		if err != nil {
+			return nil, fmt.Errorf("GetApprovalRequestResult failed: %q", err)
+		}
+		var signResp sdkms.SignResponse
+		if err := res.Parse(&signResp); err != nil {
+			return nil, fmt.Errorf("Parsing approval result failed: %q", err)
+		}
+		return signResp.Signature, nil
+	default:
+		return nil, fmt.Errorf("Bad approval status: %q", status)
+	}
+}
+
+func (signer *dsmSigner) signWithApproval(request sdkms.SignRequest, msg []byte) ([]byte, error) {
+	ctx := context.Background()
+	description := "Integrate transparency log entries"
+	approvalRequest, err := signer.client.RequestApprovalToSign(ctx, request, &description)
+	if err != nil {
+		return nil, fmt.Errorf("RequestApprovalToSign failed: %q", err)
+	}
+
+	if approvalRequest.Status == sdkms.ApprovalStatusPending && len(*suspend) != 0 {
+		// Suspend on approval pending. Write some state to the suspend file so signing
+		// can be resumed with another invocation of the tool.
+		state := QuorumSigningState{
+			Msg: msg,
+			RequestID: approvalRequest.RequestID,
+		}
+		state_json, err := json.Marshal(state)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to construct json signing state: %q", err)
+		}
+		if err := os.WriteFile(*suspend, state_json, 0644); err != nil {
+			return nil, fmt.Errorf("Unable to write json signing state to file %s: %q",
+				*suspend, err)
+		}
+		glog.Infof("Signing context written to %s", *suspend)
+		glog.Infof("When signing is approved, rerun with --resume %s", *suspend)
+		os.Exit(0)
+	}		
+
+	// Poll until request is approved.
+	return signer.waitForApproval(approvalRequest.Status, approvalRequest.RequestID)
+}
+
+func (signer *dsmSigner) resumeSigning(msg []byte) ([]byte, error) {
+	data, err := os.ReadFile(*resume)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading resume file: %q", err)
+	}
+	var state QuorumSigningState
+	err = json.Unmarshal(data, &state)
+	if err != nil {
+		return nil, fmt.Errorf("Error deserializing signing state from %s: %q", *resume, err)
+	}
+	// Check whether we still have the same log state that got signed. If we don't have the same state,
+	// we can't proceed.
+	if bytes.Compare(msg, state.Msg) != 0 {
+		return nil, fmt.Errorf("Suspended state did not match current state. Expected %s got %s",
+			string(state.Msg), string(msg))
+	}
+	approvalRequest, err := signer.client.GetApprovalRequest(context.Background(), state.RequestID)
+	return signer.waitForApproval(approvalRequest.Status, state.RequestID)
+}
+
 func (signer *dsmSigner) Sign(msg []byte) ([]byte, error) {
 	request := sdkms.SignRequest{
 		Key: signer.key,
 		HashAlg: sdkms.DigestAlgorithmSha512,
 		Data: &msg,
 	}
-	// TODO: Only implementing signing without approvals right now. Signing with approvals still needs to be
-	// implemented.
-	response, error := signer.client.Sign(context.Background(), request)
-	if error != nil {
-		return nil, error
+	
+	if len(*resume) > 0 {
+		// We're resuming a previously suspended request.
+		return signer.resumeSigning(msg)
 	}
 
-	return response.Signature, nil
+	// First, we attempt without asking for approval. This may succeed if there is no quorum policy (and we
+	// have appropriate permissions, the key exists and can be used for signing, etc.) If there is a quorum
+	// policy, we'll get an error indicating that, and we'll retry with quorum approval.
+	response, error := signer.client.Sign(context.Background(), request)
+	if error == nil {
+		return response.Signature, nil
+	}
+	if backendError, ok := error.(*sdkms.BackendError); ok {
+		if backendError.Message == "This operation requires approval" {
+			return signer.signWithApproval(request, msg)
+		}
+	}
+	return nil, error
 }
 
 func main() {
@@ -104,6 +205,10 @@ func main() {
 
 	if len(*origin) == 0 {
 		glog.Exitf("Please set --origin flag to log identifier.")
+	}
+
+	if len(*suspend) != 0 && len(*resume) != 0 {
+		glog.Exitf("You must not specify both --suspend and --resume.")
 	}
 
 	h := rfc6962.DefaultHasher
@@ -119,9 +224,17 @@ func main() {
 	var cpNote note.Note
 
 	if *initialise {
-		st, err := fs.Create(*storageDir)
-		if err != nil {
-			glog.Exitf("Failed to create log: %q", err)
+		var st *fs.Storage
+		if len(*resume) == 0 {
+			st, err = fs.Create(*storageDir)
+			if err != nil {
+				glog.Exitf("Failed to create log: %q", err)
+			}
+		} else {
+			st, err = fs.Load(*storageDir, 0)
+			if err != nil {
+				glog.Exitf("Failed to initialize log: %q", err)
+			}
 		}
 		cp := fmtlog.Checkpoint{
 			Hash: h.EmptyRoot(),
