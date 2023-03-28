@@ -34,9 +34,16 @@ The general-purpose components are:
   checkpoints issued by a verifiable log and produces co-signed checkpoints.
   This is an important role that enables the prevention or detection of certain
   types of log misbehavior (and in particular split-view attacks).
-    * [monolith](witness/golang/omniwitness/monolith) is the entry point for
+    * [omniwitness](witness/golang/cmd/omniwitness) is the entry point for
       users looking to deploy a preconfigured witness that witnesses all known
       logs.
+
+There are two experimental deployments of the witness that have been deleted but
+are signposted here for archival reasons. Both of these tools can be retrieved
+by cloning this repository at git commit `793dcf1`:
+
+* [usbarmory witness](https://github.com/google/trillian-examples/tree/793dcf1a313b1478e30f7a7e65bdf344b10f1da4/witness/golang/omniwitness/usbarmory)
+* [ethereum witness](https://github.com/google/trillian-examples/tree/793dcf1a313b1478e30f7a7e65bdf344b10f1da4/witness/ethereum)
 
 These examples and components are not supported per-se, but the Trillian team 
 will likely try to help where possible.  You can contact them via the channels 

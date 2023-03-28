@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// monolith is a single executable that runs all of the feeders and witness
+// omniwitness is a single executable that runs all of the feeders and witness
 // in a single process.
 package main
 
@@ -28,7 +28,7 @@ import (
 	"github.com/google/trillian-examples/witness/golang/internal/persistence"
 	"github.com/google/trillian-examples/witness/golang/internal/persistence/inmemory"
 	psql "github.com/google/trillian-examples/witness/golang/internal/persistence/sql"
-	"github.com/google/trillian-examples/witness/golang/omniwitness/internal/omniwitness"
+	"github.com/google/trillian-examples/witness/golang/omniwitness"
 	"golang.org/x/mod/sumdb/note"
 
 	_ "github.com/mattn/go-sqlite3" // Load drivers for sqlite3
