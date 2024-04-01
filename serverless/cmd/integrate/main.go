@@ -29,6 +29,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/fortanix/sdkms-client-go/sdkms"
@@ -96,7 +97,7 @@ func (signer *dsmSigner) KeyHash() uint32 {
 func (signer *dsmSigner) waitForApproval(status sdkms.ApprovalStatus, requestID sdkms.UUID) ([]byte, error) {
 	ctx := context.Background()
 	for status == sdkms.ApprovalStatusPending {
-		glog.Info("Waiting for signing request to be approved...")
+		fmt.Println("Waiting for signing request to be approved...")
 		time.Sleep(10 * time.Second)
 		approvalRequest, err := signer.client.GetApprovalRequest(ctx, requestID)
 		if err != nil {
@@ -122,6 +123,9 @@ func (signer *dsmSigner) waitForApproval(status sdkms.ApprovalStatus, requestID 
 
 func (signer *dsmSigner) signWithApproval(request sdkms.SignRequest, msg []byte) ([]byte, error) {
 	ctx := context.Background()
+	fmt.Print("Signing tree root \"", strings.Replace(string(msg[:]), "\n", "\\n", -1), "\"\n")
+	fmt.Print("base64-encoded tree root: ", base64.StdEncoding.EncodeToString(msg), "\n")
+
 	description := "Integrate transparency log entries"
 	approvalRequest, err := signer.client.RequestApprovalToSign(ctx, request, &description)
 	if err != nil {
@@ -146,7 +150,7 @@ func (signer *dsmSigner) signWithApproval(request sdkms.SignRequest, msg []byte)
 		glog.Infof("Signing context written to %s", *suspend)
 		glog.Infof("When signing is approved, rerun with --resume %s", *suspend)
 		os.Exit(0)
-	}		
+	}
 
 	// Poll until request is approved.
 	return signer.waitForApproval(approvalRequest.Status, approvalRequest.RequestID)
@@ -178,7 +182,7 @@ func (signer *dsmSigner) Sign(msg []byte) ([]byte, error) {
 		HashAlg: sdkms.DigestAlgorithmSha512,
 		Data: &msg,
 	}
-	
+
 	if len(*resume) > 0 {
 		// We're resuming a previously suspended request.
 		return signer.resumeSigning(msg)
@@ -301,9 +305,9 @@ func makeDsmVerifier(name string, key *sdkms.Sobject) (note.Verifier, uint32, er
 	// In Note format, the first byte of the key is the key algorithm. 1 indicates ed25519, which is the only
 	// supported key type right now.
 	pub = append([]byte{1}, pub...)
-	
+
 	pubKeyHash := keyHash(name, pub)
-	
+
 	// Unfortunately, the only provided interface to construct a standard Note verifier is via this formatted
 	// string. The alternative here is creating our own Verifier-compatible type we could directly populate,
 	// but that would involve essentially copying code from the Note implementation. It's simpler (if uglier)
@@ -391,7 +395,7 @@ func getDsmKeys() (note.Verifier, note.Signer, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("Unable to construct signer: %q", err)
 	}
-	
+
 	return verifier, signer, nil
 }
 
@@ -420,7 +424,7 @@ func getKeys() (note.Verifier, note.Signer, error) {
 	if err != nil {
 		return nil, nil, fmt.Errorf("Failed to instantiate Verifier: %q", err)
 	}
-	
+
 	// Read log private key from file or environment variable
 	var privKey string
 	if len(*privKeyFile) > 0 {
