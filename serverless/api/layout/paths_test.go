@@ -113,7 +113,9 @@ func TestSeqFromPath(t *testing.T) {
 	}
 }
 
-func TestLeafPath(t *testing.T) {
+// Helper function for testing the path creation functions that operate on hashes.
+func hashPathHelper(t *testing.T, testFunc func(string, []byte) (string, string), subpath string) {
+	t.Helper()
 	for _, test := range []struct {
 		root     string
 		hash     []byte
@@ -123,23 +125,23 @@ func TestLeafPath(t *testing.T) {
 		{
 			root:     "/root/path",
 			hash:     []byte{0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77},
-			wantDir:  "/root/path/leaves/11/22/33",
+			wantDir:  fmt.Sprintf("/root/path/%s/11/22/33", subpath),
 			wantFile: "44556677",
 		}, {
 			root:     "/root/path",
 			hash:     []byte{0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd},
-			wantDir:  "/root/path/leaves/88/99/aa",
+			wantDir:  fmt.Sprintf("/root/path/%s/88/99/aa", subpath),
 			wantFile: "bbccdd",
 		}, {
 			root:     "/a/different/root/path",
 			hash:     []byte{0x12, 0x34, 0x56, 0x78, 0x9a},
-			wantDir:  "/a/different/root/path/leaves/12/34/56",
+			wantDir:  fmt.Sprintf("/a/different/root/path/%s/12/34/56", subpath),
 			wantFile: "789a",
 		},
 	} {
 		desc := fmt.Sprintf("root %q hash %x", test.root, test.hash)
 		t.Run(desc, func(t *testing.T) {
-			gotDir, gotFile := LeafPath(test.root, test.hash)
+			gotDir, gotFile := testFunc(test.root, test.hash)
 			if gotDir != test.wantDir {
 				t.Errorf("Got dir %q want %q", gotDir, test.wantDir)
 			}
@@ -148,6 +150,14 @@ func TestLeafPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestLeafPath(t *testing.T) {
+	hashPathHelper(t, LeafPath, "leaves")
+}
+
+func TestAppIndexPath(t *testing.T) {
+	hashPathHelper(t, AppIndexPath, "app_index")
 }
 
 func TestTilePath(t *testing.T) {

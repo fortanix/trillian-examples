@@ -18,6 +18,7 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
         "encoding/json"
 	"errors"
 	"flag"
@@ -31,6 +32,8 @@ import (
 	"strings"
 
 	"github.com/golang/glog"
+	"github.com/google/trillian-examples/serverless/api"
+	"github.com/google/trillian-examples/serverless/api/layout"
 	"github.com/google/trillian-examples/serverless/client"
 	"github.com/google/trillian-examples/serverless/client/witness"
 	"github.com/transparency-dev/formats/log"
@@ -38,6 +41,45 @@ import (
 	"github.com/transparency-dev/merkle/rfc6962"
 	"golang.org/x/mod/sumdb/note"
 )
+
+const (
+	dirPerm = 0755
+	filePerm = 0644
+)
+
+type logEntryId struct {
+	hash []byte
+	index uint64
+}
+
+func appIndexToPath(base string, id string) (string, error) {
+	bytes, err := hex.DecodeString(id)
+	if err != nil {
+		return "", fmt.Errorf("Unable to hex decode app-specific index: %w", err)
+	}
+
+	indexDir, indexFile := layout.AppIndexPath(base, bytes)
+
+	return filepath.Join(indexDir, indexFile), nil
+}
+
+func findEntriesByAppIndex(path string, id string) ([]uint64, error) {
+	indexFile, err := appIndexToPath(path, id);
+	if err != nil {
+		return nil, fmt.Errorf("Unable to find path for app-specific index: %w", err)
+	}
+
+	data, err := os.ReadFile(indexFile);
+	if err != nil {
+		return nil, fmt.Errorf("Error when reading index file: %w", err)
+	}
+	var entry api.EntryList;
+	if err = json.Unmarshal(data, &entry); err != nil {
+		return nil, fmt.Errorf("Unable to decode existing JSON index: %w", err)
+	}
+
+	return entry.Indices, nil
+}
 
 func defaultCacheLocation() string {
 	hd, err := os.UserCacheDir()
@@ -80,7 +122,9 @@ var (
 	outputConsistency   = flag.String("output_consistency_proof", "", "If set, the update and consistency commands will write the verified consistency proof used to update the checkpoint to this file")
 	outputInclusion     = flag.String("output_inclusion_proof", "", "If set, the inclusion command will write the verified inclusion proof to this file")
 	inclusionHash       = flag.Bool("inclusion_hash", false, "If set to true, the inclusion command will take a base64 encoded leaf hash instead of a file name")
+	inclusionAppId      = flag.Bool("inclusion_app_id", false, "If set to true, the inclusion command will take an application-specific identifier instead of a file name")
         outputInclusionJson = flag.String("output_inclusion_proof_json", "", "If set, the inclusion command will write all portions of the inclusion proof to this file")
+	outputMultiple      = flag.Bool("output_multiple", false, "If set to true, json output is an array of matching inclusion proofs. If set to false, json output is a single object")
 )
 
 func usage() {
@@ -248,6 +292,17 @@ func (l *logClientTool) consistencyProof(ctx context.Context, args []string) err
 	return nil
 }
 
+func getLogPath(logUrl string) (string, error) {
+	parsed, err := url.Parse(logUrl)
+	if err != nil {
+		return "", fmt.Errorf("Unable to parse URL for log: %w", err)
+	}
+	if parsed.Scheme != "file" {
+		return "", fmt.Errorf("Log URL must be file schema for lookup by app-specific id")
+	}
+	return parsed.Path, nil
+}
+
 // For the inclusion subcommand, parse the command-line options and arguments to get the entry's
 // hash and index.
 //
@@ -261,26 +316,51 @@ func (l *logClientTool) consistencyProof(ctx context.Context, args []string) err
 // or leaf hash. If the index is not provided, we'll do a tree lookup to find the entry's index.
 //
 // Returns the entry's leaf hash and index, or an error.
-func (l *logClientTool) inclusionProofArgs(ctx context.Context, args []string) ([]byte, uint64, error) {
-	var lh []byte
+func (l *logClientTool) inclusionProofArgs(ctx context.Context, args []string) ([]logEntryId, error) {
+	var entries []logEntryId
 	var err error
+	var lh []byte
 
 	if l := len(args); l < 1 || l > 2 {
-		return nil, 0, fmt.Errorf("usage: inclusion <file or leaf hash> [index-in-log]")
+		return nil, fmt.Errorf("usage: inclusion <file or leaf hash> [index-in-log]")
 	}
 
-	if *inclusionHash {
+	// inclusionAppId takes precedence over inclusionHash
+	if *inclusionAppId {
+		base, err := getLogPath(*logURL)
+		if err != nil {
+			return nil, fmt.Errorf("Unable to get path for log URL: %w", err)
+		}
+		indices, err := findEntriesByAppIndex(base, args[0]);
+		if err != nil {
+			return nil, fmt.Errorf("Unable to find entries for app index: %w", err)
+		}
+		for _, index := range(indices) {
+			entrydir, entryfile := layout.SeqPath(base, index)
+			contents, err := os.ReadFile(filepath.Join(entrydir, entryfile))
+			if err != nil {
+				return nil, fmt.Errorf("Error reading index file: %w", err)
+			}
+			lh := l.Hasher.HashLeaf(contents)
+			entry := logEntryId{
+				index: index,
+				hash: lh,
+			}
+			entries = append(entries, entry)
+		}
+
+		return entries, nil
+	} else if *inclusionHash {
 		// We have a base-64 encoded leaf hash instead of the name of a file to hash.
 		lh, err = base64.StdEncoding.DecodeString(args[0])
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to base64 decode leaf hash: %w", err)
+			return nil, fmt.Errorf("failed to base64 decode leaf hash: %w", err)
 		}
-
 	} else {
 		// We have the name of a file to hash.
 		entry, err := os.ReadFile(args[0])
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to read entry from %q: %w", args[0], err)
+			return nil, fmt.Errorf("failed to read entry from %q: %w", args[0], err)
 		}
 		lh = l.Hasher.HashLeaf(entry)
 	}
@@ -289,70 +369,103 @@ func (l *logClientTool) inclusionProofArgs(ctx context.Context, args []string) (
 	if len(args) == 2 {
 		idx, err = strconv.ParseUint(args[1], 16, 64)
 		if err != nil {
-			return nil, 0, fmt.Errorf("invalid index-in-log %q: %w", args[1], err)
+			return nil, fmt.Errorf("invalid index-in-log %q: %w", args[1], err)
 		}
 	} else {
 		idx, err = client.LookupIndex(ctx, l.Fetcher, lh)
 		if err != nil {
-			return nil, 0, fmt.Errorf("failed to lookup leaf index: %w", err)
+			return nil, fmt.Errorf("failed to lookup leaf index: %w", err)
 		}
 		glog.Infof("Leaf %q found at index %d", args[0], idx)
 	}
 
-	return lh, idx, nil
+	entry := logEntryId{
+		hash: lh,
+		index: idx,
+	}
+	entries = append(entries, entry)
+	return entries, nil
 }
 
 func (l *logClientTool) inclusionProof(ctx context.Context, args []string) error {
-	lh, idx, err := l.inclusionProofArgs(ctx, args)
+	entries, err := l.inclusionProofArgs(ctx, args)
 	if err != nil {
 		return fmt.Errorf("failed to decode arguments: %w", err)
 	}
 
+	// There may be multiple proofs matching a particular app-specific index. We
+	// have no way of knowing which one the application wants, so we need to return
+	// all of them.
+	proofs := make([]proofInfo, 0, 1)
+
 	// TODO(al): wait for growth if necessary
+	for i := 0; i < len(entries); i++ {
+		entryId := entries[i]
+		idx := entries[i].index
+		cp := l.Tracker.LatestConsistent
+		builder, err := client.NewProofBuilder(ctx, cp, l.Hasher.HashChildren, l.Fetcher)
+		if err != nil {
+			return fmt.Errorf("failed to create proof builder: %w", err)
+		}
 
-	cp := l.Tracker.LatestConsistent
-	builder, err := client.NewProofBuilder(ctx, cp, l.Hasher.HashChildren, l.Fetcher)
-	if err != nil {
-		return fmt.Errorf("failed to create proof builder: %w", err)
-	}
+		p, err := builder.InclusionProof(ctx, idx)
+		if err != nil {
+			return fmt.Errorf("failed to get inclusion proof: %w", err)
+		}
 
-	p, err := builder.InclusionProof(ctx, idx)
-	if err != nil {
-		return fmt.Errorf("failed to get inclusion proof: %w", err)
-	}
+		glog.V(1).Infof("Built inclusion proof: %#x", p)
 
-	glog.V(1).Infof("Built inclusion proof: %#x", p)
+		if err := proof.VerifyInclusion(l.Hasher, idx, cp.Size, entryId.hash, p, cp.Hash); err != nil {
+			return fmt.Errorf("failed to verify inclusion proof: %q", err)
+		}
 
-	if err := proof.VerifyInclusion(l.Hasher, idx, cp.Size, lh, p, cp.Hash); err != nil {
-		return fmt.Errorf("failed to verify inclusion proof: %q", err)
-	}
+		if len(entries) == 1 {
+			glog.Infof("Inclusion verified under checkpoint:\n%s", cp.Marshal())
 
-	if o := *outputInclusion; len(o) > 0 {
-		ps := []byte(merkleProof(p).Marshal())
-		if err := os.WriteFile(o, ps, 0644); err != nil {
-			glog.Warningf("Failed to write inclusion proof to %q: %v", o, err)
+			if o := *outputInclusion; len(o) > 0 {
+				ps := []byte(merkleProof(p).Marshal())
+				if err := os.WriteFile(o, ps, 0644); err != nil {
+					glog.Warningf("Failed to write inclusion proof to %q: %v", o, err)
+				}
+			}
+		}
+		if oj:= *outputInclusionJson; len(oj) > 0 {
+			entry, err := client.GetLeaf(ctx, l.Fetcher, idx)
+			if err != nil {
+				return fmt.Errorf("Failed to retrieve entry contents: %w", err)
+			}
+
+			pi := proofInfo{
+				LeafIndex: idx,
+				Hashes: merkleProof(p),
+				LeafHash: entryId.hash,
+				LeafValue: entry,
+				RootHash: cp.Hash,
+				TreeSize: cp.Size,
+				Note: l.Tracker.CheckpointNote,
+			}
+
+			if !*outputMultiple {
+				ps, err := json.Marshal(pi)
+				if err != nil {
+					glog.Warning("Unable to convert proof to JSON")
+					return err
+				}
+
+				if err := os.WriteFile(oj, ps, 0644); err != nil {
+					glog.Warningf("Failed to write JSON inclusion proof to %q: %v", oj, err)
+					return err
+				}
+				return nil
+			}
+			proofs = append(proofs, pi)
 		}
 	}
 
         if oj:= *outputInclusionJson; len(oj) > 0 {
-		entry, err := client.GetLeaf(ctx, l.Fetcher, idx)
-		if err != nil {
-			return fmt.Errorf("Failed to retrieve entry contents: %w", err)
-		}
-
-		pi := proofInfo{
-                        LeafIndex: idx,
-                        Hashes: merkleProof(p),
-                        LeafHash: lh,
-                        LeafValue: entry,
-                        RootHash: cp.Hash,
-                        TreeSize: cp.Size,
-                        Note: l.Tracker.CheckpointNote,
-                }               
-
-                ps, err := json.Marshal(pi)
+                ps, err := json.Marshal(proofs)
                 if err != nil {
-                        glog.Warning("Unable to convert proof to JSON")
+                        glog.Warning("Unable to convert list of proofs to JSON")
                         return err
                 }
 
@@ -362,7 +475,6 @@ func (l *logClientTool) inclusionProof(ctx context.Context, args []string) error
                 }
         }
 
-	glog.Infof("Inclusion verified under checkpoint:\n%s", cp.Marshal())
 	return nil
 }
 

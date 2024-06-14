@@ -39,6 +39,18 @@ type Tile struct {
 	Nodes [][]byte
 }
 
+// This structure maps an application-specific identifier to a list of indices of entries matching that list.
+// This is to support efficient lookup of entries by the application-specific identifier. It is possible that
+// multiple log entries all correspond to the same application-specific identifier, so it is necessary to
+// refer to all matching entries so they can be all be retrieved.
+//
+// The value here is the numeric index of the entry in the log. This will need to be converted into a hexadecimal
+// string and then separated into elements to find the actual path to the log entry. This is done by the client
+// program when looking up by index.
+type EntryList struct {
+	Indices []uint64
+}
+
 // MarshalText implements encoding/TextMarshaller and writes out a Tile
 // instance in the following format:
 //

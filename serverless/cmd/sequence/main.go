@@ -18,6 +18,8 @@ package main
 
 import (
 	"context"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,18 +30,58 @@ import (
 	"golang.org/x/mod/sumdb/note"
 
 	"github.com/golang/glog"
+	"github.com/google/trillian-examples/serverless/api"
+	"github.com/google/trillian-examples/serverless/api/layout"
 	"github.com/google/trillian-examples/serverless/pkg/log"
 	"github.com/transparency-dev/merkle/rfc6962"
 
 	fmtlog "github.com/transparency-dev/formats/log"
 )
 
+const (
+	dirPerm = 0755
+	filePerm = 0644
+)
+
+
 var (
 	storageDir = flag.String("storage_dir", "", "Root directory to store log data.")
 	entries    = flag.String("entries", "", "File path glob of entries to add to the log.")
+	identifier = flag.String("identifier", "", "Optional application-specific identifier for this log entry")
 	pubKeyFile = flag.String("public_key", "", "Location of public key file. If unset, uses the contents of the SERVERLESS_LOG_PUBLIC_KEY environment variable.")
 	origin     = flag.String("origin", "", "Log origin string to check for in checkpoint.")
 )
+
+// Create or update the index entry for a particular app-specific identifier.
+func updateAppSpecificIndex(seq uint64, id string) error {
+	bytes, err := hex.DecodeString(id)
+	if err != nil {
+		return fmt.Errorf("Unable to hex decode app-specific index: %w", err)
+	}
+	indexDir, indexFile := layout.AppIndexPath(*storageDir, bytes)
+
+	if err := os.MkdirAll(indexDir, dirPerm); err != nil {
+		return fmt.Errorf("Unable to create index directory %s: %w", indexDir, err)
+	}
+
+	dataFile := filepath.Join(indexDir, indexFile)
+	var oldEntry api.EntryList
+	if oldData, err := os.ReadFile(dataFile); !os.IsNotExist(err) {
+		if err != nil {
+			return err
+		}
+		if err = json.Unmarshal(oldData, &oldEntry); err != nil {
+			return fmt.Errorf("Unable to decode existing JSON index: %w", err)
+		}
+	}
+	oldEntry.Indices = append(oldEntry.Indices, seq)
+	newData, err := json.Marshal(oldEntry)
+	if err != nil {
+		return fmt.Errorf("Unable to encode JSON index: %w", err)
+		return err
+	}
+	return os.WriteFile(dataFile, newData, filePerm)
+}
 
 func main() {
 	flag.Parse()
@@ -99,6 +141,7 @@ func main() {
 	type entryInfo struct {
 		name string
 		b    []byte
+		id   string
 	}
 	entries := make(chan entryInfo, 100)
 	go func() {
@@ -107,7 +150,7 @@ func main() {
 			if err != nil {
 				glog.Exitf("Failed to read entry file %q: %q", fp, err)
 			}
-			entries <- entryInfo{name: fp, b: b}
+			entries <- entryInfo{name: fp, b: b, id: *identifier}
 		}
 		close(entries)
 	}()
@@ -127,6 +170,10 @@ func main() {
 		l := fmt.Sprintf("%d: %v", seq, entry.name)
 		if dupe {
 			l += " (dupe)"
+		} else {
+			if len(entry.id) > 0 {
+				updateAppSpecificIndex(seq, entry.id)
+			}
 		}
 		glog.Info(l)
 	}

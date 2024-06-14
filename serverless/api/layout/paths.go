@@ -29,6 +29,8 @@ import (
 const (
 	// CheckpointPath is the location of the file containing the log checkpoint.
 	CheckpointPath = "checkpoint"
+	AppIndexSubdir = "app_index"
+	LeafSubdir = "leaves"
 )
 
 // SeqPath builds the directory path and relative filename for the entry at the given
@@ -65,12 +67,10 @@ func SeqFromPath(root, seqPath string) (uint64, error) {
 	return strconv.ParseUint(b.String(), 16, 64)
 }
 
-// LeafPath builds the directory path and relative filename for the entry data with the
-// given leafhash.
-func LeafPath(root string, leafhash []byte) (string, string) {
+func pathHelper(root string, subdir string, leafhash []byte) (string, string) {
 	frag := []string{
 		root,
-		"leaves",
+		subdir,
 		fmt.Sprintf("%02x", leafhash[0]),
 		fmt.Sprintf("%02x", leafhash[1]),
 		fmt.Sprintf("%02x", leafhash[2]),
@@ -78,6 +78,12 @@ func LeafPath(root string, leafhash []byte) (string, string) {
 	}
 	d := filepath.Join(frag[:5]...)
 	return d, frag[5]
+}
+
+// LeafPath builds the directory path and relative filename for the entry data with the
+// given leafhash.
+func LeafPath(root string, leafhash []byte) (string, string) {
+	return pathHelper(root, LeafSubdir, leafhash)
 }
 
 // TilePath builds the directory path and relative filename for the subtree tile with the
@@ -101,4 +107,10 @@ func TilePath(root string, level, index, partialTileSize uint64) (string, string
 	}
 	d := filepath.Join(frag[:6]...)
 	return d, frag[6]
+}
+
+// AppIndexPath builds the directory path and relative filename for the application-specific
+// index file.
+func AppIndexPath(root string, appIndex []byte) (string, string) {
+	return pathHelper(root, AppIndexSubdir, appIndex)
 }
